@@ -2,6 +2,7 @@ import os
 import pyodbc
 import uuid
 from datetime import datetime
+from pathlib import Path
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 
@@ -13,19 +14,16 @@ app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key')
 # Configuration
 SQL_SERVER = os.getenv('SQL_SERVER')
 SQL_DATABASE = os.getenv('SQL_DATABASE', 'msdb')
-SQL_USERNAME = os.getenv('SQL_USERNAME')
-SQL_PASSWORD = os.getenv('SQL_PASSWORD')
 NETWORK_DRIVE_ROOT = os.getenv('NETWORK_DRIVE_ROOT')
 
 
 def get_db_connection():
-    """Create and return a database connection."""
+    """Create and return a database connection using Windows Authentication."""
     conn_str = (
         f'DRIVER={{ODBC Driver 17 for SQL Server}};'
         f'SERVER={SQL_SERVER};'
         f'DATABASE={SQL_DATABASE};'
-        f'UID={SQL_USERNAME};'
-        f'PWD={SQL_PASSWORD}'
+        f'Trusted_Connection=yes;'
     )
     return pyodbc.connect(conn_str)
 
@@ -36,16 +34,16 @@ def scan_directory_for_sql(path, pattern=''):
     Only include directories that contain SQL files.
     """
     try:
+        path_obj = Path(path)
         result = {
-            'name': os.path.basename(path) or path,
-            'path': path,
+            'name': path_obj.name or str(path_obj),
+            'path': str(path_obj),
             'type': 'directory',
             'children': []
         }
 
-        items = []
         try:
-            items = os.listdir(path)
+            items = list(path_obj.iterdir())
         except (PermissionError, OSError):
             return None
 
@@ -53,24 +51,22 @@ def scan_directory_for_sql(path, pattern=''):
         files = []
         dirs = []
 
-        for item in sorted(items):
-            item_path = os.path.join(path, item)
-
-            if os.path.isfile(item_path) and item.lower().endswith('.sql'):
+        for item in sorted(items, key=lambda x: x.name):
+            if item.is_file() and item.suffix.lower() == '.sql':
                 # Apply pattern filter if provided
-                if not pattern or pattern.lower() in item.lower():
+                if not pattern or pattern.lower() in item.name.lower():
                     files.append({
-                        'name': item,
-                        'path': item_path,
+                        'name': item.name,
+                        'path': str(item),
                         'type': 'file',
-                        'size': os.path.getsize(item_path)
+                        'size': item.stat().st_size
                     })
-            elif os.path.isdir(item_path):
-                dirs.append(item_path)
+            elif item.is_dir():
+                dirs.append(item)
 
         # Recursively process subdirectories
         for dir_path in dirs:
-            child = scan_directory_for_sql(dir_path, pattern)
+            child = scan_directory_for_sql(str(dir_path), pattern)
             if child and (child.get('children') or child.get('type') == 'file'):
                 result['children'].append(child)
 
@@ -303,8 +299,11 @@ def get_files():
     pattern = request.args.get('pattern', '')
     root_path = NETWORK_DRIVE_ROOT
 
-    if not root_path or not os.path.exists(root_path):
-        return jsonify({'error': 'Network drive path not configured or not accessible'}), 400
+    if not root_path:
+        return jsonify({'error': 'Network drive path not configured'}), 400
+
+    if not Path(root_path).exists():
+        return jsonify({'error': 'Network drive path not accessible'}), 400
 
     tree = scan_directory_for_sql(root_path, pattern)
 

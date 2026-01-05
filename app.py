@@ -1,13 +1,7 @@
 import os
 import pyodbc
-import smtplib
 import uuid
-import time
-import threading
 from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from pathlib import Path
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 
@@ -22,11 +16,6 @@ SQL_DATABASE = os.getenv('SQL_DATABASE', 'msdb')
 SQL_USERNAME = os.getenv('SQL_USERNAME')
 SQL_PASSWORD = os.getenv('SQL_PASSWORD')
 NETWORK_DRIVE_ROOT = os.getenv('NETWORK_DRIVE_ROOT')
-SMTP_SERVER = os.getenv('SMTP_SERVER')
-SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
-SMTP_USERNAME = os.getenv('SMTP_USERNAME')
-SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
-SMTP_FROM_EMAIL = os.getenv('SMTP_FROM_EMAIL')
 
 
 def get_db_connection():
@@ -98,32 +87,82 @@ def scan_directory_for_sql(path, pattern=''):
         return None
 
 
-def create_agent_job(file_path, job_name=None):
+def create_or_get_operator(email_address):
     """
-    Create a SQL Server Agent job to execute a SQL file.
-    Returns the job_id.
+    Create a temporary operator for the email address or get existing one.
+    Returns the operator name.
     """
-    if not job_name:
-        job_name = f"RunSQLFile_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    job_id = str(uuid.uuid4())
+    # Create a unique but consistent operator name based on email
+    operator_name = f"TempOp_{email_address.replace('@', '_at_').replace('.', '_')}"[:128]
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
+        # Check if operator exists
+        cursor.execute("""
+            SELECT name FROM msdb.dbo.sysoperators WHERE name = ?
+        """, operator_name)
+
+        if cursor.fetchone():
+            # Operator exists, update email if needed
+            cursor.execute("""
+                EXEC msdb.dbo.sp_update_operator
+                    @name = ?,
+                    @enabled = 1,
+                    @email_address = ?
+            """, operator_name, email_address)
+        else:
+            # Create new operator
+            cursor.execute("""
+                EXEC msdb.dbo.sp_add_operator
+                    @name = ?,
+                    @enabled = 1,
+                    @email_address = ?
+            """, operator_name, email_address)
+
+        conn.commit()
+        return operator_name
+
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def create_agent_job(file_path, email_to=None, notify_on_success=False, notify_on_failure=False, job_name=None):
+    """
+    Create a SQL Server Agent job to execute a SQL file.
+    Optionally configure email notifications via SQL Server Agent operators.
+    Returns the job_id and job_name.
+    """
+    if not job_name:
+        job_name = f"RunSQLFile_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    job_id = str(uuid.uuid4())
+    operator_name = None
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        # Create operator if email notifications are requested
+        if email_to and (notify_on_success or notify_on_failure):
+            operator_name = create_or_get_operator(email_to)
+
         # Create the job
         cursor.execute("""
             EXEC msdb.dbo.sp_add_job
                 @job_name = ?,
                 @enabled = 1,
-                @description = 'Auto-generated job to run SQL file',
+                @description = ?,
                 @delete_level = 1,
                 @job_id = ? OUTPUT
-        """, job_name, job_id)
+        """, job_name, f'Auto-generated job to run SQL file: {file_path}', job_id)
 
-        # Add job step
-        step_command = f"EXEC run_query_file '{file_path}'"
+        # Add job step with email notifications on failure at step level
         cursor.execute("""
             EXEC msdb.dbo.sp_add_jobstep
                 @job_name = ?,
@@ -131,8 +170,10 @@ def create_agent_job(file_path, job_name=None):
                 @subsystem = 'TSQL',
                 @command = ?,
                 @retry_attempts = 0,
-                @retry_interval = 0
-        """, job_name, step_command)
+                @retry_interval = 0,
+                @on_success_action = 1,
+                @on_fail_action = 2
+        """, job_name, f"EXEC run_query_file '{file_path}'")
 
         # Add job to local server
         cursor.execute("""
@@ -140,6 +181,29 @@ def create_agent_job(file_path, job_name=None):
                 @job_name = ?,
                 @server_name = '(local)'
         """, job_name)
+
+        # Add notification settings if operator is configured
+        if operator_name:
+            notify_level_success = 1 if notify_on_success else 0  # 1 = When the job succeeds
+            notify_level_failure = 2 if notify_on_failure else 0  # 2 = When the job fails
+
+            # Combine notification levels (0=Never, 1=Success, 2=Failure, 3=Always)
+            if notify_on_success and notify_on_failure:
+                notify_level = 3
+            elif notify_on_success:
+                notify_level = 1
+            elif notify_on_failure:
+                notify_level = 2
+            else:
+                notify_level = 0
+
+            if notify_level > 0:
+                cursor.execute("""
+                    EXEC msdb.dbo.sp_update_job
+                        @job_name = ?,
+                        @notify_level_email = ?,
+                        @notify_email_operator_name = ?
+                """, job_name, notify_level, operator_name)
 
         conn.commit()
 
@@ -227,89 +291,6 @@ def get_job_status(job_name):
         conn.close()
 
 
-def monitor_job_and_notify(job_name, file_paths, email_to, notify_on_success, notify_on_failure):
-    """
-    Monitor a job and send email notifications based on status.
-    This runs in a separate thread.
-    """
-    max_wait_time = 3600  # 1 hour max
-    check_interval = 5  # Check every 5 seconds
-    elapsed_time = 0
-
-    while elapsed_time < max_wait_time:
-        time.sleep(check_interval)
-        elapsed_time += check_interval
-
-        status, message = get_job_status(job_name)
-
-        if status == 'succeeded':
-            if notify_on_success and email_to:
-                send_email(
-                    to_email=email_to,
-                    subject=f"SQL Job Succeeded: {job_name}",
-                    body=f"""
-                    <html>
-                    <body>
-                        <h2>SQL Job Completed Successfully</h2>
-                        <p><strong>Job Name:</strong> {job_name}</p>
-                        <p><strong>Files Executed:</strong></p>
-                        <ul>
-                            {''.join([f'<li>{fp}</li>' for fp in file_paths])}
-                        </ul>
-                        <p><strong>Status:</strong> Success</p>
-                        <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                    </body>
-                    </html>
-                    """
-                )
-            break
-
-        elif status == 'failed':
-            if notify_on_failure and email_to:
-                send_email(
-                    to_email=email_to,
-                    subject=f"SQL Job Failed: {job_name}",
-                    body=f"""
-                    <html>
-                    <body>
-                        <h2>SQL Job Failed</h2>
-                        <p><strong>Job Name:</strong> {job_name}</p>
-                        <p><strong>Files Executed:</strong></p>
-                        <ul>
-                            {''.join([f'<li>{fp}</li>' for fp in file_paths])}
-                        </ul>
-                        <p><strong>Status:</strong> Failed</p>
-                        <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                        <p><strong>Error Message:</strong></p>
-                        <pre>{message}</pre>
-                    </body>
-                    </html>
-                    """
-                )
-            break
-
-
-def send_email(to_email, subject, body):
-    """Send an email notification."""
-    try:
-        msg = MIMEMultipart('alternative')
-        msg['From'] = SMTP_FROM_EMAIL
-        msg['To'] = to_email
-        msg['Subject'] = subject
-
-        msg.attach(MIMEText(body, 'html'))
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
-
-        print(f"Email sent to {to_email}")
-
-    except Exception as e:
-        print(f"Failed to send email: {str(e)}")
-
-
 @app.route('/')
 def index():
     """Render the main page."""
@@ -338,7 +319,7 @@ def execute_files():
     """API endpoint to execute selected SQL files."""
     data = request.json
     file_paths = data.get('files', [])
-    email_to = data.get('email_to', '')
+    email_to = data.get('email_to', '').strip()
     notify_on_success = data.get('notify_on_success', False)
     notify_on_failure = data.get('notify_on_failure', False)
 
@@ -346,27 +327,26 @@ def execute_files():
         return jsonify({'error': 'No files selected'}), 400
 
     try:
-        # Create a single job for all files
-        # In a more complex scenario, you might create separate jobs
-        # For now, we'll create one job per file
         jobs_created = []
 
         for file_path in file_paths:
-            job_id, job_name = create_agent_job(file_path)
+            # Create job with email notification configuration
+            # SQL Server Agent will handle the email notifications natively
+            job_id, job_name = create_agent_job(
+                file_path=file_path,
+                email_to=email_to if email_to else None,
+                notify_on_success=notify_on_success,
+                notify_on_failure=notify_on_failure
+            )
             jobs_created.append({'job_id': job_id, 'job_name': job_name, 'file': file_path})
 
-            # Start monitoring thread if email notifications are enabled
-            if email_to and (notify_on_success or notify_on_failure):
-                thread = threading.Thread(
-                    target=monitor_job_and_notify,
-                    args=(job_name, [file_path], email_to, notify_on_success, notify_on_failure)
-                )
-                thread.daemon = True
-                thread.start()
+        notification_msg = ""
+        if email_to and (notify_on_success or notify_on_failure):
+            notification_msg = f" Email notifications will be sent to {email_to}."
 
         return jsonify({
             'success': True,
-            'message': f'Created {len(jobs_created)} job(s)',
+            'message': f'Created {len(jobs_created)} job(s).{notification_msg}',
             'jobs': jobs_created
         })
 

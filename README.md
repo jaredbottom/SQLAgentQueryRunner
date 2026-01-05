@@ -17,9 +17,9 @@ A Python web application for executing SQL files from network locations using SQ
 The application works by:
 1. Scanning a configured network drive for SQL files
 2. Creating SQL Server Agent jobs that call a stored procedure: `EXEC run_query_file '\\path\to\file.sql'`
-3. Monitoring job execution in background threads
-4. Sending email notifications based on job status
-5. Jobs are configured to self-delete (`@delete_level = 1`)
+3. Configuring SQL Server Agent operators and job notifications for email alerts
+4. SQL Server Agent sends email notifications natively using Database Mail
+5. Jobs are configured to self-delete upon completion (`@delete_level = 1`)
 
 ## Prerequisites
 
@@ -28,7 +28,7 @@ The application works by:
 - ODBC Driver 17 for SQL Server installed
 - Access to a network drive containing SQL files
 - A stored procedure named `run_query_file` that accepts a file path parameter
-- SMTP server access for email notifications
+- SQL Server Database Mail configured (for email notifications)
 
 ### Installing ODBC Driver (if not already installed)
 
@@ -90,17 +90,12 @@ ACCEPT_EULA=Y yum install -y msodbcsql17
    # Network Drive Path
    NETWORK_DRIVE_ROOT=\\networkdrive\sql_files
 
-   # Email Configuration
-   SMTP_SERVER=smtp.your-domain.com
-   SMTP_PORT=587
-   SMTP_USERNAME=your_smtp_username
-   SMTP_PASSWORD=your_smtp_password
-   SMTP_FROM_EMAIL=sql-agent@your-domain.com
-
    # Application Settings
    FLASK_SECRET_KEY=your-secret-key-here
    FLASK_DEBUG=False
    ```
+
+   **Note:** Email notifications are handled natively by SQL Server Agent using Database Mail. No SMTP configuration is needed in the application.
 
 ## Required SQL Server Setup
 
@@ -145,6 +140,93 @@ END;
 - Pre-loading scripts into staging tables
 
 Ensure proper permissions and security measures are in place for your specific implementation.
+
+### Configuring SQL Server Database Mail
+
+For email notifications to work, you must configure SQL Server Database Mail. This is a one-time setup on your SQL Server instance.
+
+**1. Enable Database Mail:**
+
+```sql
+-- Enable Database Mail
+USE msdb;
+GO
+
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+GO
+
+EXEC sp_configure 'Database Mail XPs', 1;
+RECONFIGURE;
+GO
+```
+
+**2. Create a Database Mail Profile and Account:**
+
+```sql
+-- Create a Database Mail account
+EXEC msdb.dbo.sysmail_add_account_sp
+    @account_name = 'SQLAgentMailAccount',
+    @description = 'Mail account for SQL Agent notifications',
+    @email_address = 'sqlagent@your-domain.com',
+    @display_name = 'SQL Agent',
+    @mailserver_name = 'smtp.your-domain.com',
+    @port = 587,
+    @username = 'your-smtp-username',
+    @password = 'your-smtp-password',
+    @enable_ssl = 1;
+
+-- Create a Database Mail profile
+EXEC msdb.dbo.sysmail_add_profile_sp
+    @profile_name = 'SQLAgentMailProfile',
+    @description = 'Profile for SQL Agent notifications';
+
+-- Add the account to the profile
+EXEC msdb.dbo.sysmail_add_profileaccount_sp
+    @profile_name = 'SQLAgentMailProfile',
+    @account_name = 'SQLAgentMailAccount',
+    @sequence_number = 1;
+
+-- Grant access to the profile
+EXEC msdb.dbo.sysmail_add_principalprofile_sp
+    @profile_name = 'SQLAgentMailProfile',
+    @principal_name = 'public',
+    @is_default = 1;
+```
+
+**3. Configure SQL Server Agent to use Database Mail:**
+
+```sql
+-- Configure SQL Server Agent to use Database Mail
+USE msdb;
+GO
+
+EXEC msdb.dbo.sp_set_sqlagent_properties
+    @databasemail_profile = 'SQLAgentMailProfile',
+    @use_databasemail = 1;
+GO
+```
+
+**4. Restart SQL Server Agent:**
+
+After configuring Database Mail, restart the SQL Server Agent service for changes to take effect.
+
+**5. Test Database Mail (Optional):**
+
+```sql
+-- Send a test email
+EXEC msdb.dbo.sp_send_dbmail
+    @profile_name = 'SQLAgentMailProfile',
+    @recipients = 'test@your-domain.com',
+    @subject = 'Test Email from SQL Server',
+    @body = 'This is a test email from SQL Server Database Mail.';
+
+-- Check the mail queue status
+SELECT * FROM msdb.dbo.sysmail_allitems;
+SELECT * FROM msdb.dbo.sysmail_faileditems;
+```
+
+**Note:** The application automatically creates SQL Server Agent operators for each email address you specify in the web interface. The operators are named with the pattern `TempOp_<email>` and are reused for subsequent jobs.
 
 ## Usage
 

@@ -315,12 +315,43 @@
                     renderFileTree(data);
                 },
                 error: function(xhr) {
-                    const error = xhr.responseJSON?.error || 'Failed to load files';
-                    $('#fileTree').html(`
+                    const response = xhr.responseJSON || {};
+                    const error = response.error || 'Failed to load files';
+                    const details = response.details || '';
+                    const path = response.path || '';
+                    const technicalDetails = response.technical_details || '';
+
+                    let errorHtml = `
                         <div class="alert alert-danger alert-custom">
-                            <i class="fas fa-exclamation-triangle"></i> ${error}
+                            <h5><i class="fas fa-exclamation-triangle"></i> ${error}</h5>
+                    `;
+
+                    if (details) {
+                        errorHtml += `<p class="mb-2"><strong>Details:</strong> ${details}</p>`;
+                    }
+
+                    if (path) {
+                        errorHtml += `<p class="mb-2"><strong>Path:</strong> <code>${path}</code></p>`;
+                    }
+
+                    if (technicalDetails) {
+                        errorHtml += `
+                            <details class="mt-2">
+                                <summary style="cursor: pointer;"><strong>Technical Details</strong></summary>
+                                <pre class="mt-2 p-2 bg-light border rounded" style="font-size: 0.85em;">${technicalDetails}</pre>
+                            </details>
+                        `;
+                    }
+
+                    errorHtml += `
+                            <hr class="my-3">
+                            <p class="mb-0 small">
+                                <i class="fas fa-info-circle"></i> Check the terminal/console logs for more detailed error information.
+                            </p>
                         </div>
-                    `);
+                    `;
+
+                    $('#fileTree').html(errorHtml);
                 }
             });
         }

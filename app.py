@@ -1,6 +1,7 @@
 import os
 import pyodbc
 import uuid
+import logging
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify
@@ -11,10 +12,22 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key')
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Configuration
 SQL_SERVER = os.getenv('SQL_SERVER')
 SQL_DATABASE = os.getenv('SQL_DATABASE', 'msdb')
 NETWORK_DRIVE_ROOT = os.getenv('NETWORK_DRIVE_ROOT')
+
+# Log configuration on startup
+logger.info(f"SQL Server: {SQL_SERVER}")
+logger.info(f"SQL Database: {SQL_DATABASE}")
+logger.info(f"Network Drive Root: {NETWORK_DRIVE_ROOT}")
 
 
 def get_db_connection():
@@ -25,7 +38,14 @@ def get_db_connection():
         f'DATABASE={SQL_DATABASE};'
         f'Trusted_Connection=yes;'
     )
-    return pyodbc.connect(conn_str)
+    try:
+        logger.debug(f"Attempting database connection to {SQL_SERVER}/{SQL_DATABASE}")
+        conn = pyodbc.connect(conn_str)
+        logger.debug("Database connection successful")
+        return conn
+    except pyodbc.Error as e:
+        logger.error(f"Database connection failed: {str(e)}")
+        raise
 
 
 def scan_directory_for_sql(path, pattern=''):
@@ -44,7 +64,11 @@ def scan_directory_for_sql(path, pattern=''):
 
         try:
             items = list(path_obj.iterdir())
-        except (PermissionError, OSError):
+        except PermissionError as e:
+            logger.warning(f"Permission denied accessing directory: {path} - {str(e)}")
+            return None
+        except OSError as e:
+            logger.error(f"OS error accessing directory: {path} - {str(e)}")
             return None
 
         # Separate files and directories
@@ -52,17 +76,21 @@ def scan_directory_for_sql(path, pattern=''):
         dirs = []
 
         for item in sorted(items, key=lambda x: x.name):
-            if item.is_file() and item.suffix.lower() == '.sql':
-                # Apply pattern filter if provided
-                if not pattern or pattern.lower() in item.name.lower():
-                    files.append({
-                        'name': item.name,
-                        'path': str(item),
-                        'type': 'file',
-                        'size': item.stat().st_size
-                    })
-            elif item.is_dir():
-                dirs.append(item)
+            try:
+                if item.is_file() and item.suffix.lower() == '.sql':
+                    # Apply pattern filter if provided
+                    if not pattern or pattern.lower() in item.name.lower():
+                        files.append({
+                            'name': item.name,
+                            'path': str(item),
+                            'type': 'file',
+                            'size': item.stat().st_size
+                        })
+                elif item.is_dir():
+                    dirs.append(item)
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Error accessing {item}: {str(e)}")
+                continue
 
         # Recursively process subdirectories
         for dir_path in dirs:
@@ -79,7 +107,7 @@ def scan_directory_for_sql(path, pattern=''):
         return None
 
     except Exception as e:
-        print(f"Error scanning {path}: {str(e)}")
+        logger.error(f"Unexpected error scanning {path}: {type(e).__name__} - {str(e)}")
         return None
 
 
@@ -300,17 +328,90 @@ def get_files():
     root_path = NETWORK_DRIVE_ROOT
 
     if not root_path:
-        return jsonify({'error': 'Network drive path not configured'}), 400
+        error_msg = 'Network drive path not configured in .env file (NETWORK_DRIVE_ROOT)'
+        logger.error(error_msg)
+        return jsonify({'error': error_msg}), 400
 
-    if not Path(root_path).exists():
-        return jsonify({'error': 'Network drive path not accessible'}), 400
+    logger.info(f"Attempting to access network path: {root_path}")
 
+    try:
+        path_obj = Path(root_path)
+
+        # Check if path exists
+        if not path_obj.exists():
+            error_msg = f"Network path does not exist: {root_path}"
+            logger.error(error_msg)
+            return jsonify({
+                'error': 'Network drive path not accessible',
+                'details': error_msg,
+                'path': root_path
+            }), 400
+
+        # Check if it's a directory
+        if not path_obj.is_dir():
+            error_msg = f"Path exists but is not a directory: {root_path}"
+            logger.error(error_msg)
+            return jsonify({
+                'error': 'Network drive path is not a directory',
+                'details': error_msg,
+                'path': root_path
+            }), 400
+
+        # Try to access the directory
+        try:
+            list(path_obj.iterdir())
+        except PermissionError as e:
+            error_msg = f"Permission denied accessing: {root_path}"
+            logger.error(f"{error_msg} - {str(e)}")
+            return jsonify({
+                'error': 'Permission denied',
+                'details': f"Cannot access network path due to permissions: {root_path}",
+                'technical_details': str(e)
+            }), 403
+        except OSError as e:
+            error_msg = f"OS error accessing: {root_path}"
+            logger.error(f"{error_msg} - {str(e)}")
+            return jsonify({
+                'error': 'Network path access error',
+                'details': f"Error accessing network path: {str(e)}",
+                'path': root_path
+            }), 500
+
+    except Exception as e:
+        error_msg = f"Unexpected error checking path: {root_path}"
+        logger.error(f"{error_msg} - {type(e).__name__}: {str(e)}")
+        return jsonify({
+            'error': 'Unexpected error',
+            'details': f"{type(e).__name__}: {str(e)}",
+            'path': root_path
+        }), 500
+
+    logger.info(f"Successfully accessed network path, scanning for SQL files...")
     tree = scan_directory_for_sql(root_path, pattern)
 
     if tree:
+        file_count = count_files_in_tree(tree)
+        logger.info(f"Found {file_count} SQL file(s)")
         return jsonify(tree)
     else:
-        return jsonify({'error': 'No SQL files found'}), 404
+        logger.warning(f"No SQL files found in {root_path}")
+        return jsonify({
+            'error': 'No SQL files found',
+            'details': f'No .sql files found in the network path or subdirectories',
+            'path': root_path
+        }), 404
+
+
+def count_files_in_tree(tree):
+    """Count total files in tree structure."""
+    count = 0
+    if tree and 'children' in tree:
+        for child in tree['children']:
+            if child['type'] == 'file':
+                count += 1
+            elif child['type'] == 'directory':
+                count += count_files_in_tree(child)
+    return count
 
 
 @app.route('/api/execute', methods=['POST'])
@@ -322,27 +423,51 @@ def execute_files():
     notify_on_success = data.get('notify_on_success', False)
     notify_on_failure = data.get('notify_on_failure', False)
 
+    logger.info(f"Execute request received for {len(file_paths)} file(s)")
+
     if not file_paths:
+        logger.warning("Execute request with no files selected")
         return jsonify({'error': 'No files selected'}), 400
 
     try:
         jobs_created = []
 
         for file_path in file_paths:
+            logger.info(f"Creating job for file: {file_path}")
             # Create job with email notification configuration
             # SQL Server Agent will handle the email notifications natively
-            job_id, job_name = create_agent_job(
-                file_path=file_path,
-                email_to=email_to if email_to else None,
-                notify_on_success=notify_on_success,
-                notify_on_failure=notify_on_failure
-            )
-            jobs_created.append({'job_id': job_id, 'job_name': job_name, 'file': file_path})
+            try:
+                job_id, job_name = create_agent_job(
+                    file_path=file_path,
+                    email_to=email_to if email_to else None,
+                    notify_on_success=notify_on_success,
+                    notify_on_failure=notify_on_failure
+                )
+                jobs_created.append({'job_id': job_id, 'job_name': job_name, 'file': file_path})
+                logger.info(f"Successfully created job {job_name} for {file_path}")
+            except pyodbc.Error as e:
+                error_msg = f"Database error creating job for {file_path}: {str(e)}"
+                logger.error(error_msg)
+                return jsonify({
+                    'error': 'Database error',
+                    'details': error_msg,
+                    'file': file_path
+                }), 500
+            except Exception as e:
+                error_msg = f"Error creating job for {file_path}: {type(e).__name__} - {str(e)}"
+                logger.error(error_msg)
+                return jsonify({
+                    'error': 'Job creation failed',
+                    'details': str(e),
+                    'file': file_path
+                }), 500
 
         notification_msg = ""
         if email_to and (notify_on_success or notify_on_failure):
             notification_msg = f" Email notifications will be sent to {email_to}."
+            logger.info(f"Email notifications configured for {email_to}")
 
+        logger.info(f"Successfully created {len(jobs_created)} job(s)")
         return jsonify({
             'success': True,
             'message': f'Created {len(jobs_created)} job(s).{notification_msg}',
@@ -350,7 +475,12 @@ def execute_files():
         })
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        error_msg = f"Unexpected error in execute_files: {type(e).__name__} - {str(e)}"
+        logger.error(error_msg)
+        return jsonify({
+            'error': 'Unexpected error',
+            'details': str(e)
+        }), 500
 
 
 @app.route('/api/job-status/<job_name>')
